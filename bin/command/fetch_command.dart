@@ -45,12 +45,20 @@ class FetchCommand extends Command {
     final tempDir = Directory("temp");
     final rootDir = Directory("./");
 
+    final options = config["options"];
     final remote = config["remote"];
     final owner = remote["owner"] as String?;
     final repository = remote["repository"] as String?;
 
     // Default to 'main' if branch is not specified.
     final branch = (remote["branch"] as String?) ?? "main";
+
+    // Determines whether fetched files should be automatically added to `.gitignore`.
+    // Defaults to true to prevent unintentional commits of remote configuration files.
+    final gitignore = options?["gitignore"] ?? true;
+
+    // List of all fetched file paths (for later gitignore update)
+    final fetchedFiles = <String>[];
 
     try {
       log("Fetching private git config...");
@@ -89,14 +97,83 @@ class FetchCommand extends Command {
           final newFile = File(
             "${rootDir.path}${Platform.pathSeparator}$relativePath",
           )..createSync(recursive: true);
+
           await entity.copy(newFile.path);
+
+          // Track copied file for potential .gitignore addition.
+          fetchedFiles.add(relativePath);
         }
       }
 
       log("Config files copied into ${rootDir.absolute}", color: green);
+
+      if (fetchedFiles.isNotEmpty) {
+        await ensureGitignored(fetchedFiles, gitignore);
+      }
     } finally {
       // Clean up the temporary directory after fetching.
       await tempDir.delete(recursive: true);
+    }
+  }
+
+  /// Ensures that the given files are listed in `.gitignore`.
+  /// Adds missing entries to prevent accidental commits
+  /// of fetched config files.
+  Future<void> ensureGitignored(
+    List<String> files,
+    bool isAllowModify,
+  ) async {
+    final gitignoreFile = File('.gitignore');
+
+    // Create `.gitignore` only when modification is allowed.
+    if (isAllowModify && !gitignoreFile.existsSync()) {
+      gitignoreFile.createSync();
+    }
+
+    final newEntries = <String>[];
+
+    // Check which files are not yet ignored by Git.
+    for (final file in files) {
+      final normalized = file.replaceAll('\\', '/');
+      final result = await Process.run(
+        "git",
+        ["check-ignore", "-v", normalized],
+        workingDirectory: Directory.current.path,
+      );
+
+      // When the file is not ignored.
+      if (result.exitCode == 1) {
+        newEntries.add(normalized);
+      }
+    }
+
+    // If there are files that need to be ignored.
+    if (newEntries.isNotEmpty) {
+      // Append missing entries to `.gitignore`.
+      if (isAllowModify) {
+        gitignoreFile.writeAsStringSync(
+          "${newEntries.join("\n")}\n",
+          mode: FileMode.append,
+        );
+
+        if (newEntries.length > 1) {
+          log(
+            "Added ${newEntries.length} new ${newEntries.length == 1 ? "entry" : "entries"} to .gitignore:",
+            color: green,
+          );
+        } else {
+          log("Added '${newEntries.first}' to .gitignore", color: green);
+        }
+      }
+
+      // Log results for both added and untracked files.
+      for (final entry in newEntries) {
+        if (isAllowModify) {
+          if (newEntries.length > 1) log("  - $entry", color: gray);
+        } else {
+          log("Warning: '$entry' is not tracked by .gitignore", color: yellow);
+        }
+      }
     }
   }
 }
